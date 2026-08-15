@@ -1,0 +1,712 @@
+{
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "kSXVsl6rFH-h"
+      },
+      "source": [
+        "# 패턴인식 Group Project — Income Prediction (CatBoost)\n",
+        "# Group 16"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 1,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "7uJQQ5rCFH-k",
+        "outputId": "4bc1032d-ff6e-49c8-ac32-9c5d3ae6ce19"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "\u001b[2K   \u001b[90m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\u001b[0m \u001b[32m97.1/97.1 MB\u001b[0m \u001b[31m8.7 MB/s\u001b[0m eta \u001b[36m0:00:00\u001b[0m\n",
+            "\u001b[?25h"
+          ]
+        }
+      ],
+      "source": [
+        "!pip install catboost --quiet"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 2,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "kbro-yFlFH-l",
+        "outputId": "b0592091-2869-4598-b6c0-c78e74f02cca"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Mounted at /content/drive\n"
+          ]
+        }
+      ],
+      "source": [
+        "from google.colab import drive\n",
+        "drive.mount('/content/drive')"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 3,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "ePjO1aNUFH-m",
+        "outputId": "3606e8bc-e860-45f8-a9fa-9cd1c521288e"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Train shape: (39073, 15)\n",
+            "Test shape: (9769, 14)\n"
+          ]
+        }
+      ],
+      "source": [
+        "import pandas as pd\n",
+        "import numpy as np\n",
+        "from sklearn.model_selection import train_test_split, KFold\n",
+        "from sklearn.metrics import f1_score, roc_auc_score\n",
+        "from catboost import CatBoostClassifier\n",
+        "\n",
+        "\n",
+        "TRAIN_PATH = '/content/drive/MyDrive/Colab Notebooks/Pattern/train.xlsx'\n",
+        "TEST_PATH = '/content/drive/MyDrive/Colab Notebooks/Pattern/test.xlsx'\n",
+        "USE_EXCEL = True\n",
+        "RANDOM_STATE = 42\n",
+        "\n",
+        "# 1. 데이터 로드\n",
+        "if USE_EXCEL:\n",
+        "    train_df = pd.read_excel(TRAIN_PATH)\n",
+        "    test_df = pd.read_excel(TEST_PATH)\n",
+        "else:\n",
+        "    train_df = pd.read_csv(TRAIN_PATH)\n",
+        "    test_df = pd.read_csv(TEST_PATH)\n",
+        "\n",
+        "print('Train shape:', train_df.shape)\n",
+        "print('Test shape:', test_df.shape)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "MVdXeUs3FH-m"
+      },
+      "source": [
+        "## 2. Base Feature Engineering"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 4,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "COhqX2OkFH-n",
+        "outputId": "0bbb114a-5126-46d0-e915-91e42e5d4982"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Base FE 적용 후: (39073, 19) | (9769, 19)\n"
+          ]
+        }
+      ],
+      "source": [
+        "def base_engineering(df):\n",
+        "    \"\"\"TalkFile 원본 6개 feature (baseline)\"\"\"\n",
+        "    df = df.copy()\n",
+        "    df = df.replace(r'^\\s*\\?\\s*$', 'Unknown', regex=True)\n",
+        "    for col in df.select_dtypes(include='object').columns:\n",
+        "        df[col] = df[col].astype(str).str.strip()\n",
+        "\n",
+        "    df['cap_net'] = df['capital_gain'] - df['capital_loss']\n",
+        "    df['has_capital_stats'] = ((df['capital_gain'] > 0) | (df['capital_loss'] > 0)).astype(int)\n",
+        "    df['gain_per_hour'] = df['capital_gain'] / (df['hours_per_week'] + 1)\n",
+        "    df['age_bins'] = pd.cut(\n",
+        "        df['age'], bins=[0, 25, 35, 45, 60, 100],\n",
+        "        labels=['Young', 'Junior', 'Senior', 'Veteran', 'Retired']\n",
+        "    ).astype(str)\n",
+        "    df['sex_marital'] = df['sex'].astype(str) + '_' + df['marital_status'].astype(str)\n",
+        "    df['edu_occ'] = df['education'].astype(str) + '_' + df['occupation'].astype(str)\n",
+        "\n",
+        "    cat_cols = df.select_dtypes(include=['object']).columns\n",
+        "    for col in cat_cols:\n",
+        "        df[col] = df[col].fillna('Unknown').astype(str)\n",
+        "    return df\n",
+        "\n",
+        "y = (train_df['income'].astype(str).str.strip() == '>50K').astype(int)\n",
+        "test_ids = test_df['id']\n",
+        "\n",
+        "X = base_engineering(train_df.drop(columns=['income', 'id']))\n",
+        "X_test = base_engineering(test_df.drop(columns=['id']))\n",
+        "\n",
+        "print('Base FE 적용 후:', X.shape, '|', X_test.shape)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "v8sBojjWFH-n"
+      },
+      "source": [
+        "## 3.Target Encoding (KFold OOF) — 누수 방지\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 5,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "c3ojVcaWFH-n",
+        "outputId": "745411f8-8066-4e7e-e483-b34b794e62b2"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "  occupation_te 추가됨 (train mean=0.2393, test mean=0.2380)\n",
+            "  native_country_te 추가됨 (train mean=0.2395, test mean=0.2394)\n",
+            "  edu_occ_te 추가됨 (train mean=0.2414, test mean=0.2404)\n",
+            "  sex_marital_te 추가됨 (train mean=0.2395, test mean=0.2372)\n",
+            "  workclass_te 추가됨 (train mean=0.2390, test mean=0.2407)\n",
+            "\n",
+            "Target Encoding 후: X=(39073, 24), X_test=(9769, 24)\n"
+          ]
+        }
+      ],
+      "source": [
+        "def kfold_target_encode(train_series, target, test_series, n_splits=5, smoothing=10, random_state=42):\n",
+        "    \"\"\"\n",
+        "    KFold target encoding (out-of-fold) — 누수 방지.\n",
+        "\n",
+        "    Args:\n",
+        "        train_series: 범주형 train 값 (pd.Series)\n",
+        "        target: y_train (pd.Series)\n",
+        "        test_series: 범주형 test 값\n",
+        "        n_splits: KFold 수 (보통 5)\n",
+        "        smoothing: 적은 샘플 카테고리에 global mean 영향력 (높을수록 보수적)\n",
+        "\n",
+        "    Returns:\n",
+        "        encoded_train, encoded_test\n",
+        "    \"\"\"\n",
+        "    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)\n",
+        "    global_mean = target.mean()\n",
+        "    encoded_train = pd.Series(index=train_series.index, dtype=float)\n",
+        "\n",
+        "    # Train: OOF 인코딩\n",
+        "    for train_idx, val_idx in kf.split(train_series):\n",
+        "        fold_train_x = train_series.iloc[train_idx]\n",
+        "        fold_train_y = target.iloc[train_idx]\n",
+        "\n",
+        "        agg = fold_train_y.groupby(fold_train_x).agg(['mean', 'count'])\n",
+        "        # Smoothed mean: 적은 count의 카테고리는 global_mean으로 끌림\n",
+        "        smooth = (agg['mean'] * agg['count'] + global_mean * smoothing) / (agg['count'] + smoothing)\n",
+        "\n",
+        "        encoded_train.iloc[val_idx] = train_series.iloc[val_idx].map(smooth).fillna(global_mean).values\n",
+        "\n",
+        "    # Test: 전체 train으로 인코딩\n",
+        "    agg_full = target.groupby(train_series).agg(['mean', 'count'])\n",
+        "    smooth_full = (agg_full['mean'] * agg_full['count'] + global_mean * smoothing) / (agg_full['count'] + smoothing)\n",
+        "    encoded_test = test_series.map(smooth_full).fillna(global_mean)\n",
+        "\n",
+        "    return encoded_train, encoded_test\n",
+        "\n",
+        "# 고카디널리티 범주형에 target encoding 적용\n",
+        "te_cols = ['occupation', 'native_country', 'edu_occ', 'sex_marital', 'workclass']\n",
+        "\n",
+        "for col in te_cols:\n",
+        "    enc_train, enc_test = kfold_target_encode(\n",
+        "        X[col], y, X_test[col],\n",
+        "        n_splits=5, smoothing=10, random_state=RANDOM_STATE\n",
+        "    )\n",
+        "    X[f'{col}_te'] = enc_train.values\n",
+        "    X_test[f'{col}_te'] = enc_test.values\n",
+        "    print(f'  {col}_te 추가됨 (train mean={enc_train.mean():.4f}, test mean={enc_test.mean():.4f})')\n",
+        "\n",
+        "print(f'\\nTarget Encoding 후: X={X.shape}, X_test={X_test.shape}')"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "AGIvEYvFFH-o"
+      },
+      "source": [
+        "## 4. Group Aggregation Features\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 6,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "xlc9uRluFH-o",
+        "outputId": "be578724-ceaf-4dce-f84f-db1246d13a29"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "  occupation별 ['age', 'education_num', 'hours_per_week'] 평균 추가됨\n",
+            "  native_country별 ['education_num', 'hours_per_week'] 평균 추가됨\n",
+            "  workclass별 ['age', 'hours_per_week'] 평균 추가됨\n",
+            "\n",
+            "Group Aggregation 후: X=(39073, 31), X_test=(9769, 31)\n",
+            "총 컬럼: 31개\n"
+          ]
+        }
+      ],
+      "source": [
+        "def add_group_aggregations(train_df, test_df, group_col, num_cols):\n",
+        "    \"\"\"\n",
+        "    그룹별 평균을 train_df, test_df에 새 컬럼으로 추가 (train 통계 기반).\n",
+        "\n",
+        "    Args:\n",
+        "        train_df, test_df: 변환할 dataframe\n",
+        "        group_col: 그룹화 기준 (예: 'occupation')\n",
+        "        num_cols: 평균을 구할 수치형 컬럼들\n",
+        "    \"\"\"\n",
+        "    # Train에서만 통계 계산\n",
+        "    group_stats = train_df.groupby(group_col)[num_cols].mean()\n",
+        "\n",
+        "    for col in num_cols:\n",
+        "        new_col = f'{group_col}_mean_{col}'\n",
+        "        train_df[new_col] = train_df[group_col].map(group_stats[col])\n",
+        "        test_df[new_col] = test_df[group_col].map(group_stats[col])\n",
+        "        # test에 없는 카테고리 발생 시 train global mean으로 채움\n",
+        "        global_mean = train_df[col].mean()\n",
+        "        train_df[new_col] = train_df[new_col].fillna(global_mean)\n",
+        "        test_df[new_col] = test_df[new_col].fillna(global_mean)\n",
+        "\n",
+        "    return train_df, test_df\n",
+        "\n",
+        "# 적용\n",
+        "agg_specs = [\n",
+        "    ('occupation',     ['age', 'education_num', 'hours_per_week']),\n",
+        "    ('native_country', ['education_num', 'hours_per_week']),\n",
+        "    ('workclass',      ['age', 'hours_per_week']),\n",
+        "]\n",
+        "\n",
+        "for group_col, num_cols in agg_specs:\n",
+        "    X, X_test = add_group_aggregations(X, X_test, group_col, num_cols)\n",
+        "    print(f'  {group_col}별 {num_cols} 평균 추가됨')\n",
+        "\n",
+        "print(f'\\nGroup Aggregation 후: X={X.shape}, X_test={X_test.shape}')\n",
+        "print(f'총 컬럼: {X.shape[1]}개')"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 7,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "yXukYDq8FH-p",
+        "outputId": "e3558275-0d99-492d-e0e1-6b2ce03ca3ec"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "범주형 컬럼 수: 11\n",
+            "수치형 컬럼 수: 20\n",
+            "\n",
+            "전체 컬럼:\n",
+            "  age (int64)\n",
+            "  workclass (object)\n",
+            "  education (object)\n",
+            "  education_num (int64)\n",
+            "  marital_status (object)\n",
+            "  occupation (object)\n",
+            "  relationship (object)\n",
+            "  race (object)\n",
+            "  sex (object)\n",
+            "  capital_gain (int64)\n",
+            "  capital_loss (int64)\n",
+            "  hours_per_week (int64)\n",
+            "  native_country (object)\n",
+            "  cap_net (int64)\n",
+            "  has_capital_stats (int64)\n",
+            "  gain_per_hour (float64)\n",
+            "  age_bins (object)\n",
+            "  sex_marital (object)\n",
+            "  edu_occ (object)\n",
+            "  occupation_te (float64)\n",
+            "  native_country_te (float64)\n",
+            "  edu_occ_te (float64)\n",
+            "  sex_marital_te (float64)\n",
+            "  workclass_te (float64)\n",
+            "  occupation_mean_age (float64)\n",
+            "  occupation_mean_education_num (float64)\n",
+            "  occupation_mean_hours_per_week (float64)\n",
+            "  native_country_mean_education_num (float64)\n",
+            "  native_country_mean_hours_per_week (float64)\n",
+            "  workclass_mean_age (float64)\n",
+            "  workclass_mean_hours_per_week (float64)\n"
+          ]
+        }
+      ],
+      "source": [
+        "# 범주형 피처 자동 인식\n",
+        "cat_features = X.select_dtypes(include=['object']).columns.tolist()\n",
+        "print('범주형 컬럼 수:', len(cat_features))\n",
+        "print('수치형 컬럼 수:', X.shape[1] - len(cat_features))\n",
+        "print('\\n전체 컬럼:')\n",
+        "for c in X.columns:\n",
+        "    print(f'  {c} ({X[c].dtype})')"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "5HhInA2SFH-p"
+      },
+      "source": [
+        "## 5. 데이터 분할 (단일 train/val split)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 8,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "hXBxNjePFH-p",
+        "outputId": "e0c19ed0-7985-4b1b-f05c-1f4fc1a23b1a"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Train: (31258, 31) | Val: (7815, 31)\n"
+          ]
+        }
+      ],
+      "source": [
+        "X_train, X_val, y_train, y_val = train_test_split(\n",
+        "    X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y\n",
+        ")\n",
+        "print('Train:', X_train.shape, '| Val:', X_val.shape)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "_IkUxc4VFH-q"
+      },
+      "source": [
+        "## 6. CatBoost 학습"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 9,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "2TL2iQ56FH-q",
+        "outputId": "d59ebf4f-84f5-4ca6-97e7-61603eb88a58"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "0:\tlearn: 0.6713811\ttest: 0.6712731\tbest: 0.6712731 (0)\ttotal: 298ms\tremaining: 12m 24s\n",
+            "200:\tlearn: 0.2904514\ttest: 0.2903990\tbest: 0.2903990 (200)\ttotal: 28.1s\tremaining: 5m 21s\n",
+            "400:\tlearn: 0.2785880\ttest: 0.2833993\tbest: 0.2833993 (400)\ttotal: 54.2s\tremaining: 4m 43s\n",
+            "600:\tlearn: 0.2715912\ttest: 0.2800787\tbest: 0.2800787 (600)\ttotal: 1m 16s\tremaining: 4m\n",
+            "800:\tlearn: 0.2670277\ttest: 0.2781647\tbest: 0.2781647 (800)\ttotal: 1m 41s\tremaining: 3m 34s\n",
+            "1000:\tlearn: 0.2634293\ttest: 0.2772964\tbest: 0.2772876 (994)\ttotal: 2m 7s\tremaining: 3m 11s\n",
+            "1200:\tlearn: 0.2596640\ttest: 0.2766420\tbest: 0.2766262 (1188)\ttotal: 2m 39s\tremaining: 2m 52s\n",
+            "1400:\tlearn: 0.2565678\ttest: 0.2762718\tbest: 0.2762718 (1400)\ttotal: 3m 6s\tremaining: 2m 25s\n",
+            "1600:\tlearn: 0.2535299\ttest: 0.2757815\tbest: 0.2757807 (1599)\ttotal: 3m 33s\tremaining: 2m\n",
+            "1800:\tlearn: 0.2507830\ttest: 0.2756149\tbest: 0.2756086 (1796)\ttotal: 4m 1s\tremaining: 1m 33s\n",
+            "2000:\tlearn: 0.2477165\ttest: 0.2754115\tbest: 0.2753601 (1966)\ttotal: 4m 29s\tremaining: 1m 7s\n",
+            "2200:\tlearn: 0.2449259\ttest: 0.2751904\tbest: 0.2751815 (2193)\ttotal: 4m 55s\tremaining: 40.2s\n",
+            "2400:\tlearn: 0.2422275\ttest: 0.2751285\tbest: 0.2750785 (2348)\ttotal: 5m 22s\tremaining: 13.3s\n",
+            "2499:\tlearn: 0.2409420\ttest: 0.2750314\tbest: 0.2750245 (2498)\ttotal: 5m 36s\tremaining: 0us\n",
+            "\n",
+            "bestTest = 0.2750244541\n",
+            "bestIteration = 2498\n",
+            "\n",
+            "Shrink model to first 2499 iterations.\n"
+          ]
+        },
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "CatBoostClassifier(bagging_temperature=0.8, border_count=254, cat_features=['workclass', 'education', 'marital_status', 'occupation', 'relationship', 'race', 'sex', 'native_country', 'age_bins', 'sex_marital', 'edu_occ'], depth=7, early_stopping_rounds=200, iterations=2500, l2_leaf_reg=10, learning_rate=0.02, random_seed=42, random_strength=1, verbose=200)"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 9
+        }
+      ],
+      "source": [
+        "model = CatBoostClassifier(\n",
+        "    iterations=2500,\n",
+        "    learning_rate=0.02,\n",
+        "    depth=7,\n",
+        "    l2_leaf_reg=10,\n",
+        "    bagging_temperature=0.8,\n",
+        "    random_strength=1,\n",
+        "    border_count=254,\n",
+        "    random_seed=RANDOM_STATE,\n",
+        "    cat_features=cat_features,\n",
+        "    early_stopping_rounds=200,\n",
+        "    verbose=200\n",
+        ")\n",
+        "\n",
+        "model.fit(X_train, y_train, eval_set=(X_val, y_val), use_best_model=True)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "CGa5j3VCFH-q"
+      },
+      "source": [
+        "## 7. Threshold 최적화"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 10,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "bNQX6lQiFH-r",
+        "outputId": "feae5b3d-d95f-4501-e49a-20a88395022b"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "\n",
+            "==================================================\n",
+            "최적 Threshold: 0.4220\n",
+            "검증 AUC: 0.9306\n",
+            "검증 F1: 0.7373\n",
+            "최종 Target ((F1+AUC)/2): 0.8339\n",
+            "==================================================\n"
+          ]
+        }
+      ],
+      "source": [
+        "val_probs = model.predict_proba(X_val)[:, 1]\n",
+        "auc_score = roc_auc_score(y_val, val_probs)\n",
+        "\n",
+        "best_threshold = 0.5\n",
+        "best_metric = -1\n",
+        "\n",
+        "for th in np.linspace(0.1, 0.8, 701):\n",
+        "    val_preds = (val_probs >= th).astype(int)\n",
+        "    f1 = f1_score(y_val, val_preds)\n",
+        "    current_metric = (f1 + auc_score) / 2\n",
+        "    if current_metric > best_metric:\n",
+        "        best_metric = current_metric\n",
+        "        best_threshold = th\n",
+        "\n",
+        "print('\\n' + '=' * 50)\n",
+        "print(f'최적 Threshold: {best_threshold:.4f}')\n",
+        "print(f'검증 AUC: {auc_score:.4f}')\n",
+        "print(f'검증 F1: {f1_score(y_val, (val_probs >= best_threshold).astype(int)):.4f}')\n",
+        "print(f'최종 Target ((F1+AUC)/2): {best_metric:.4f}')\n",
+        "print('=' * 50)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "fd8yNz2DFH-r"
+      },
+      "source": [
+        "## 8. 전체 데이터 재학습 및 prediction.csv 저장"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 11,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "hyxKNzvWFH-r",
+        "outputId": "519f35ce-fc49-43d8-bed9-bf3813ef091a"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "prediction.csv 생성 완료\n",
+            "Test 예측 분포:\n",
+            "y_cls\n",
+            "0    7474\n",
+            "1    2295\n",
+            "Name: count, dtype: int64\n",
+            "\n",
+            "샘플:\n",
+            "      id  y_cls    y_prob\n",
+            "0   7763      0  0.002038\n",
+            "1  23882      0  0.216877\n",
+            "2  30508      0  0.069374\n",
+            "3  28912      1  0.989130\n",
+            "4  19485      0  0.000339\n"
+          ]
+        }
+      ],
+      "source": [
+        "model.fit(X, y, cat_features=cat_features, verbose=False)\n",
+        "test_probs = model.predict_proba(X_test)[:, 1]\n",
+        "test_cls = (test_probs >= best_threshold).astype(int)\n",
+        "\n",
+        "prediction_df = pd.DataFrame({\n",
+        "    'id': test_ids,\n",
+        "    'y_cls': test_cls,\n",
+        "    'y_prob': test_probs\n",
+        "})\n",
+        "prediction_df.to_csv('prediction.csv', index=False)\n",
+        "\n",
+        "print('prediction.csv 생성 완료')\n",
+        "print('Test 예측 분포:')\n",
+        "print(prediction_df['y_cls'].value_counts())\n",
+        "print('\\n샘플:')\n",
+        "print(prediction_df.head())"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 12,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/",
+          "height": 17
+        },
+        "id": "C460NBPhFH-s",
+        "outputId": "7a7e3a74-cf93-4ebb-e418-21f2f1b5fa66"
+      },
+      "outputs": [
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": [
+              "<IPython.core.display.Javascript object>"
+            ],
+            "application/javascript": [
+              "\n",
+              "    async function download(id, filename, size) {\n",
+              "      if (!google.colab.kernel.accessAllowed) {\n",
+              "        return;\n",
+              "      }\n",
+              "      const div = document.createElement('div');\n",
+              "      const label = document.createElement('label');\n",
+              "      label.textContent = `Downloading \"${filename}\": `;\n",
+              "      div.appendChild(label);\n",
+              "      const progress = document.createElement('progress');\n",
+              "      progress.max = size;\n",
+              "      div.appendChild(progress);\n",
+              "      document.body.appendChild(div);\n",
+              "\n",
+              "      const buffers = [];\n",
+              "      let downloaded = 0;\n",
+              "\n",
+              "      const channel = await google.colab.kernel.comms.open(id);\n",
+              "      // Send a message to notify the kernel that we're ready.\n",
+              "      channel.send({})\n",
+              "\n",
+              "      for await (const message of channel.messages) {\n",
+              "        // Send a message to notify the kernel that we're ready.\n",
+              "        channel.send({})\n",
+              "        if (message.buffers) {\n",
+              "          for (const buffer of message.buffers) {\n",
+              "            buffers.push(buffer);\n",
+              "            downloaded += buffer.byteLength;\n",
+              "            progress.value = downloaded;\n",
+              "          }\n",
+              "        }\n",
+              "      }\n",
+              "      const blob = new Blob(buffers, {type: 'application/binary'});\n",
+              "      const a = document.createElement('a');\n",
+              "      a.href = window.URL.createObjectURL(blob);\n",
+              "      a.download = filename;\n",
+              "      div.appendChild(a);\n",
+              "      a.click();\n",
+              "      div.remove();\n",
+              "    }\n",
+              "  "
+            ]
+          },
+          "metadata": {}
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": [
+              "<IPython.core.display.Javascript object>"
+            ],
+            "application/javascript": [
+              "download(\"download_4255eef2-6c00-493a-a014-48462bb4bdbb\", \"prediction.csv\", 273265)"
+            ]
+          },
+          "metadata": {}
+        }
+      ],
+      "source": [
+        "from google.colab import files\n",
+        "files.download('prediction.csv')"
+      ]
+    }
+  ],
+  "metadata": {
+    "kernelspec": {
+      "display_name": "Python 3",
+      "language": "python",
+      "name": "python3"
+    },
+    "language_info": {
+      "name": "python",
+      "version": "3.10"
+    },
+    "colab": {
+      "provenance": []
+    }
+  },
+  "nbformat": 4,
+  "nbformat_minor": 0
+}
